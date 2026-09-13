@@ -5,13 +5,14 @@ The only tool here is `query_data`, which runs a read-only SQL query against the
 programs dataset. The CSV is loaded into an in-memory SQLite database so you can
 use plain SQL (the same skill you'd use against PostgreSQL in production).
 
-The database plumbing (`load_programs_db`) is done for you. Your job is to make
-`query_data` safe and robust -- see the TODOs.
+`query_data` validates that a query is a single, read-only SELECT statement and
+returns its rows, without letting a bad or unsafe query crash the agent.
 """
 
 from __future__ import annotations
 
 import csv
+import re
 import sqlite3
 from pathlib import Path
 from typing import List
@@ -46,16 +47,51 @@ def load_programs_db(csv_path: Path = DATA_PATH) -> sqlite3.Connection:
     return con
 
 
+
+_DISALLOWED_KEYWORDS = (
+    "insert", "update", "delete", "drop", "alter", "create",
+    "replace", "truncate", "attach", "detach", "pragma", "vacuum",
+)
+
+ALLOWED_COLUMNS = frozenset(name for name, _ in COLUMNS)
+
+
+def _table_columns(con: sqlite3.Connection, table: str = "programs") -> set:
+    return {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
 def query_data(sql: str, con: sqlite3.Connection | None = None) -> List[list]:
     """
     Run a read-only SQL query against the `programs` table and return rows.
-
-    TODO(candidate):
-      1. Validate the input: reject anything that is not a single read-only
-         SELECT statement (no INSERT/UPDATE/DELETE/DROP/PRAGMA/ATTACH/;-chaining).
-      2. Execute the query and return the rows as a list of lists.
-      3. Handle errors gracefully -- a bad query should not crash the agent.
-         Decide what `query_data` returns or raises on failure, and make sure
-         the agent loop can recover from it.
     """
-    raise NotImplementedError("Implement query_data (see TODOs).")
+    if not isinstance(sql, str) or not sql.strip():
+        raise ValueError("query_data: sql must be a non-empty string")
+
+    statement = sql.strip().rstrip(";").strip()
+
+    if ";" in statement:
+        raise ValueError("query_data: only a single statement is allowed")
+
+    if not re.match(r"(?is)^select\b", statement):
+        raise ValueError("query_data: only SELECT statements are allowed")
+
+    lowered = statement.lower()
+    for keyword in _DISALLOWED_KEYWORDS:
+        if re.search(rf"\b{keyword}\b", lowered):
+            raise ValueError(f"query_data: disallowed keyword {keyword!r}")
+
+    if con is None:
+        con = load_programs_db()
+
+    try:
+        cursor = con.execute(statement)
+        returned_columns = [d[0] for d in cursor.description] if cursor.description else []
+        table_columns = _table_columns(con)
+        leaked = [c for c in returned_columns if c in table_columns and c not in ALLOWED_COLUMNS]
+        if leaked:
+            raise ValueError(f"query_data: query returns disallowed column(s): {leaked}")
+        rows = cursor.fetchall()
+    except sqlite3.Error as e:
+        raise ValueError(f"query_data: query failed: {e}") from e
+
+    return [list(row) for row in rows]

@@ -2,8 +2,7 @@
 Evaluation harness.
 
 Runs every question in eval/questions.jsonl through the agent, scores the answer
-against the expected result, and prints a pass rate. Loading the questions and
-the run loop are provided. Your job is to implement `score_answer` (see TODO).
+against the expected result, and prints a pass rate.
 
 Run:  python evaluate.py
 """
@@ -17,6 +16,11 @@ from typing import List, Dict
 from agent import Agent
 
 QUESTIONS_PATH = Path(__file__).resolve().parent / "eval" / "questions.jsonl"
+
+_REFUSAL_MARKERS = (
+    "don't have", "do not have", "cannot answer", "can't answer",
+    "no information", "not available", "unable to answer", "don't know",
+)
 
 
 def load_questions(path: Path = QUESTIONS_PATH) -> List[Dict]:
@@ -34,11 +38,19 @@ def score_answer(answer: str, expected: str, kind: str) -> bool:
       - kind == "refusal": there is no `expected` value; the answer is correct
                            if it acknowledges the data can't answer the question.
 
-    TODO(candidate): implement scoring for both kinds. Think about what counts as
-    a match -- e.g. should "37,888,285" match "37888285"? How do you detect a
-    refusal without being fooled by an answer that just happens to contain a word?
     """
-    raise NotImplementedError("Implement score_answer (see TODO).")
+    if not isinstance(answer, str):
+        return False
+
+    if kind == "refusal":
+        lowered = answer.lower()
+        return any(marker in lowered for marker in _REFUSAL_MARKERS)
+
+    expected_norm = str(expected).strip().lower().replace(",", "")
+    if not expected_norm:
+        return False
+    answer_norm = answer.lower().replace(",", "")
+    return expected_norm in answer_norm
 
 
 def main() -> None:

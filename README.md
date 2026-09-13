@@ -108,4 +108,75 @@ simple beats clever and fragile.
 
 ## Production notes
 
-_(Your notes here.)_
+The design goal throughout was to keep three things separate: the thing that
+decides (the LLM), the thing that acts (the tool), and the thing that checks
+(the eval). That separation is what makes most of the following possible
+without a rewrite.
+
+**Provider swap.** `agent.py` never imports a provider SDK — it only calls
+`self.llm.complete(messages)`, so `RealLLM.complete` in `llm.py` is the only
+place that changes. It would translate our `{"role", "content"}` messages into
+whatever shape the provider's chat API expects, call it, and return the raw
+text. Two things to get right so it stays swappable later: keep the JSON
+tool-call protocol in the system prompt itself rather than leaning on a
+provider's native function-calling API (that would mean re-parsing per
+provider), and keep credentials/model names in environment variables so
+switching is a config change, not a code change.
+
+**Reliability in a regulated setting.** A 10-question eval is a smoke test,
+not a monitoring strategy. In production I'd want three layers: a much larger,
+versioned regression set that runs in CI on every prompt/tool/provider change
+(and specifically includes adversarial inputs — prompt injection attempts,
+SQL-shaped questions, PII-shaped questions); structured logging of every
+request — question, full message trace including the SQL that ran, final
+answer, latency, token count — so any answer can be reconstructed and audited
+after the fact, which matters more in a research/compliance context than in a
+typical consumer app; and a thin human-review layer sampling live answers,
+since an automated eval only ever catches the failure modes someone thought to
+write a test for. I'd track pass rate split by category (value vs. refusal)
+rather than one blended number, since a regression in one category is easy to
+lose in an average.
+
+**Cost, latency, concurrency, and scale.** Cost and latency both scale with
+LLM round-trips per question — today that's up to `MAX_STEPS`, so capping it
+low is already the main lever, alongside using a cheap/fast model for the
+tool-vs-answer decision and reserving anything larger for the final synthesis
+step. But the current code has a concurrency problem worth naming honestly:
+`Agent.__init__` opens one SQLite connection per `Agent` instance and holds it
+for the object's lifetime, and a default SQLite connection isn't safe to share
+across threads. A single long-lived `Agent` serving concurrent requests would
+either serialize on that connection or crash — neither is acceptable at any
+real scale. The fix is to stop treating the DB connection as agent state:
+either open a short-lived connection per request, or move to Postgres and pull
+a connection from a pool per call. From there, scaling out is standard web
+service shape — a stateless process per request/worker behind a load
+balancer, horizontal autoscaling on request volume, and a connection pool
+sized to the DB rather than to any single process. The one thing that doesn't
+scale by adding more machines is the LLM provider's own rate limit, so that's
+worth a request queue or backpressure mechanism once volume is real, plus
+caching for repeated or near-duplicate questions to avoid paying for the same
+round-trip twice.
+
+**CSV to Postgres.** `query_data`'s validation logic barely changes — it's
+still "reject anything that isn't a single safe SELECT," just against
+`psycopg`/`SQLAlchemy` instead of `sqlite3`. What does change: run those
+queries as a dedicated read-only DB role as a second layer of defense below
+the application-level checks, add a statement timeout and a row cap so a wide
+query can't return unbounded data or tie up a connection, and get a real
+connection pool since (per above) that's now load-bearing for concurrency, not
+optional. For deployment: package the agent behind a small stateless HTTP
+service (FastAPI is a natural fit given the existing type hints), run it in a
+container so it scales horizontally, point it at a managed Postgres instance,
+and keep secrets in a secrets manager rather than env files once it's not just
+running on a laptop.
+
+**A second agent.** Not for this problem — it's one bounded skill (turn a
+question into a query, turn a query result into a sentence), and splitting
+that into multiple agents would add coordination cost without removing any
+real complexity. I'd reach for a second agent only when a genuinely distinct
+skill shows up that wants its own prompt, tools, or even model — for example,
+a planner that decomposes a multi-part question into several queries for a
+simpler executor to run, or a reviewer that checks a sensitive answer before
+it goes out in a compliance-heavy setting. Until there's a concrete case like
+that, one agent with one tool is easier to test, debug, and reason about than
+a small multi-agent system would be.
